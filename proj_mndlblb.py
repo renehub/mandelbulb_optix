@@ -8,11 +8,11 @@ beta-offset sliders.  Each fractal parameter can be animated independently
 (ping-pong) with its own min/max boundaries and its own animation speed.
 Every light has an on/off checkbox and independent RGB controls; only the key
 light is enabled by default.  Each light row also has its own Orbit checkbox
-and orbit-speed slider.  The fractal material has a colour tint, and the
-ambient fill has its own RGB colour.  The control legend lives inside the
-bottom-left panel, and H hides/shows all control panels.  OptiX traverses a
-bounding sphere and the closest-hit program ray marches the Mandelbulb
-distance field.
+and orbit-speed slider.  The fractal material has a colour tint, an optional
+glass-refraction mode with adjustable IOR, and the ambient fill has its own
+RGB colour.  The control legend lives inside the bottom-left panel, and H
+hides/shows all control panels.  OptiX traverses a bounding sphere and the
+closest-hit program ray marches the Mandelbulb distance field.
 
 Requirements
 ------------
@@ -31,6 +31,8 @@ Controls
     + / -            zoom in / out
     Quality slider   render quality, bottom-left
     Shininess slider control the fractal material, bottom-left
+    Glass checkbox   switch the fractal to refractive glass, bottom-left
+    IOR slider       glass index of refraction, bottom-left
     Lights panel     key/fill/rim checkboxes + RGB, top-left
     Orbit checkbox   per-light orbit toggle
     S sliders        per-light orbit speed, in each light row
@@ -112,6 +114,7 @@ BOUND_RADIUS_SQ = BOUND_RADIUS * BOUND_RADIUS
 BOUND_HALF = BOUND_RADIUS
 FLOOR_Y = -2.1
 FLOOR_CELL = 1.2
+TEAPOT_SCALE = 0.72
 
 POWER_MIN = 2.0
 POWER_MAX = 16.0
@@ -160,6 +163,9 @@ DEFAULT_LIGHTS = tuple(
 )
 FRACTAL_COLOR_DEFAULT = (1.0, 1.0, 1.0)
 AMBIENT_COLOR_DEFAULT = (1.0, 1.0, 1.0)
+GLASS_IOR_MIN = 1.0
+GLASS_IOR_MAX = 2.0
+GLASS_IOR_DEFAULT = 1.45
 _SKY_KEY_DIR_PY = _norm3(-0.52, 0.68, 0.42)
 _SKY_KEY_TANGENT_PY = _norm3(*_cross3(_SKY_KEY_DIR_PY, (0.0, 1.0, 0.0)))
 _SKY_KEY_BI_PY = _cross3(_SKY_KEY_TANGENT_PY, _SKY_KEY_DIR_PY)
@@ -262,6 +268,11 @@ class SceneFrame:
     light_color2: wp.vec3
     fractal_color: wp.vec3
     ambient_color: wp.vec3
+    glass_enabled: int
+    glass_ior: float
+    teapot_active: int
+    teapot_pos: wp.vec3
+    teapot_yaw: float
     floor_n_local: wp.vec3
     floor_sky_up: wp.vec3
     fractal_power: float
@@ -284,6 +295,11 @@ def make_scene_frame(
     fractal_rgb=FRACTAL_COLOR_DEFAULT,
     ambient_rgb=AMBIENT_COLOR_DEFAULT,
     light_angles=(0.0, 0.0, 0.0),
+    glass_enabled: bool = False,
+    glass_ior: float = GLASS_IOR_DEFAULT,
+    teapot_active: bool = False,
+    teapot_pos=(0.0, 0.0, 0.0),
+    teapot_yaw: float = 0.0,
 ) -> SceneFrame:
     ca = math.cos(spin)
     sa = math.sin(spin)
@@ -351,6 +367,15 @@ def make_scene_frame(
         min(max(float(ambient_rgb[1]), 0.0), 1.0),
         min(max(float(ambient_rgb[2]), 0.0), 1.0),
     )
+    frame.glass_enabled = 1 if glass_enabled else 0
+    frame.glass_ior = min(max(float(glass_ior), GLASS_IOR_MIN), GLASS_IOR_MAX)
+    frame.teapot_active = 1 if teapot_active else 0
+    frame.teapot_pos = wp.vec3(
+        float(teapot_pos[0]),
+        float(teapot_pos[1]),
+        float(teapot_pos[2]),
+    )
+    frame.teapot_yaw = float(teapot_yaw)
     frame.floor_n_local = wp.vec3(r0[1], r1[1], r2[1])
     frame.floor_sky_up = wp.vec3(_FLOOR_SKY_UP)
     frame.fractal_power = float(power)
@@ -661,6 +686,26 @@ def mandelbulb_normal(
 
 
 @wp.func
+def mandelbulb_normal_wide(
+    p_local: wp.vec3,
+    d0: float,
+    max_iterations: int,
+    power: float,
+    alpha: float,
+    beta: float,
+) -> wp.vec3:
+    h = 0.015
+    gx = mandelbulb_de(p_local + wp.vec3(h, 0.0, 0.0), max_iterations, power, alpha, beta) - d0
+    gy = mandelbulb_de(p_local + wp.vec3(0.0, h, 0.0), max_iterations, power, alpha, beta) - d0
+    gz = mandelbulb_de(p_local + wp.vec3(0.0, 0.0, h), max_iterations, power, alpha, beta) - d0
+    n = wp.vec3(gx, gy, gz)
+    length = wp.length(n)
+    if length < 1.0e-9:
+        return wp.normalize(p_local + wp.vec3(0.0, 1.0e-6, 0.0))
+    return n / length
+
+
+@wp.func
 def cavity_ao(
     p_local: wp.vec3,
     n_local: wp.vec3,
@@ -884,6 +929,11 @@ def shade_floor(
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
             )
 
+    if frame.glass_enabled != 0:
+        visibility0 = 1.0 - (1.0 - visibility0) * 0.45
+        visibility1 = 1.0 - (1.0 - visibility1) * 0.45
+        visibility2 = 1.0 - (1.0 - visibility2) * 0.45
+
     color = wp.vec3(0.0)
     if wp.dot(frame.light_color0, frame.light_color0) > 1.0e-12:
         color += direct_light_term(n, v, albedo, roughness, f0, frame.light_world0, frame.light_color0, 1.0) * visibility0
@@ -898,8 +948,310 @@ def shade_floor(
     reflected = wp.vec3(rd_world[0], -rd_world[1], rd_world[2])
     color += wp.cw_mul(sky_color(reflected), fresnel_schlick(cos_theta, f0)) * 0.28
 
+    if frame.teapot_active != 0:
+        dx = p_world[0] - frame.teapot_pos[0]
+        dz = p_world[2] - frame.teapot_pos[2]
+        height = wp.max(0.0, frame.teapot_pos[1] - FLOOR_Y)
+        radius = 0.36 + 0.22 * height
+        dist = wp.sqrt(dx * dx + dz * dz)
+        blob = 1.0 - wp.smoothstep(radius * 0.35, radius, dist)
+        color = color * (1.0 - (0.42 * blob) / (1.0 + 0.8 * height))
+
     fog = wp.smoothstep(11.0, 32.0, t_floor)
     color = wp.lerp(color, background_color(rd_world, camera.forward), fog * 0.92)
+    return color
+
+
+@wp.func
+def teapot_ellipsoid(p: wp.vec3, center: wp.vec3, radii: wp.vec3) -> float:
+    q = p - center
+    q = wp.vec3(q[0] / radii[0], q[1] / radii[1], q[2] / radii[2])
+    return (wp.length(q) - 1.0) * wp.min(radii[0], wp.min(radii[1], radii[2]))
+
+
+@wp.func
+def teapot_capsule(p: wp.vec3, a: wp.vec3, b: wp.vec3, radius: float) -> float:
+    pa = p - a
+    ba = b - a
+    h = wp.clamp(wp.dot(pa, ba) / wp.max(wp.dot(ba, ba), 1.0e-9), 0.0, 1.0)
+    return wp.length(pa - ba * h) - radius
+
+
+@wp.func
+def teapot_torus_xy(p: wp.vec3, center: wp.vec3, major: float, minor: float) -> float:
+    q = p - center
+    return wp.length(wp.vec2(wp.length(wp.vec2(q[0], q[1])) - major, q[2])) - minor
+
+
+@wp.func
+def teapot_sdf_local(p: wp.vec3) -> float:
+    body = teapot_ellipsoid(p, wp.vec3(0.0, 0.36, 0.0), wp.vec3(0.38, 0.31, 0.38))
+    base = teapot_ellipsoid(p, wp.vec3(0.0, 0.10, 0.0), wp.vec3(0.31, 0.10, 0.31))
+    lid = teapot_ellipsoid(p, wp.vec3(0.0, 0.67, 0.0), wp.vec3(0.24, 0.06, 0.24))
+    knob = teapot_ellipsoid(p, wp.vec3(0.0, 0.74, 0.0), wp.vec3(0.06, 0.055, 0.06))
+    spout = teapot_capsule(
+        p,
+        wp.vec3(0.28, 0.36, 0.0),
+        wp.vec3(0.72, 0.56, 0.0),
+        0.075,
+    )
+    spout_tip = teapot_ellipsoid(p, wp.vec3(0.72, 0.56, 0.0), wp.vec3(0.08, 0.065, 0.08))
+    handle = teapot_torus_xy(p, wp.vec3(-0.34, 0.36, 0.0), 0.27, 0.055)
+
+    d = wp.min(body, base)
+    d = wp.min(d, lid)
+    d = wp.min(d, knob)
+    d = wp.min(d, spout)
+    d = wp.min(d, spout_tip)
+    d = wp.min(d, handle)
+    return d
+
+
+@wp.func
+def world_to_teapot(p_world: wp.vec3, frame: SceneFrame) -> wp.vec3:
+    d = p_world - frame.teapot_pos
+    ca = wp.cos(frame.teapot_yaw)
+    sa = wp.sin(frame.teapot_yaw)
+    return wp.vec3(d[0] * ca - d[2] * sa, d[1], d[0] * sa + d[2] * ca)
+
+
+@wp.func
+def teapot_dir_to_world(v: wp.vec3, frame: SceneFrame) -> wp.vec3:
+    ca = wp.cos(frame.teapot_yaw)
+    sa = wp.sin(frame.teapot_yaw)
+    return wp.vec3(v[0] * ca + v[2] * sa, v[1], -v[0] * sa + v[2] * ca)
+
+
+@wp.func
+def teapot_sdf_world(p_world: wp.vec3, frame: SceneFrame) -> float:
+    p_local = world_to_teapot(p_world, frame) / TEAPOT_SCALE
+    return teapot_sdf_local(p_local) * TEAPOT_SCALE
+
+
+@wp.func
+def teapot_normal_world(p_world: wp.vec3, frame: SceneFrame) -> wp.vec3:
+    p_local = world_to_teapot(p_world, frame) / TEAPOT_SCALE
+    e = 0.0025
+    n_local = wp.vec3(
+        teapot_sdf_local(p_local + wp.vec3(e, 0.0, 0.0))
+        - teapot_sdf_local(p_local - wp.vec3(e, 0.0, 0.0)),
+        teapot_sdf_local(p_local + wp.vec3(0.0, e, 0.0))
+        - teapot_sdf_local(p_local - wp.vec3(0.0, e, 0.0)),
+        teapot_sdf_local(p_local + wp.vec3(0.0, 0.0, e))
+        - teapot_sdf_local(p_local - wp.vec3(0.0, 0.0, e)),
+    )
+    return teapot_dir_to_world(wp.normalize(n_local), frame)
+
+
+@wp.func
+def teapot_intersect(
+    ro: wp.vec3,
+    rd: wp.vec3,
+    frame: SceneFrame,
+    max_steps: int,
+) -> wp.vec2:
+    if frame.teapot_active == 0:
+        return wp.vec2(-1.0, 0.0)
+
+    center = frame.teapot_pos + wp.vec3(0.0, 0.40 * TEAPOT_SCALE, 0.0)
+    bounds_radius = 0.95 * TEAPOT_SCALE
+    oc = ro - center
+    b = wp.dot(oc, rd)
+    c = wp.dot(oc, oc) - bounds_radius * bounds_radius
+    disc = b * b - c
+    if disc < 0.0:
+        return wp.vec2(-1.0, 0.0)
+    root = wp.sqrt(disc)
+    t_start = wp.max(-b - root, 0.001)
+    t_end = -b + root
+    if t_start >= t_end:
+        return wp.vec2(-1.0, 0.0)
+
+    steps = max_steps // 4
+    if steps < 24:
+        steps = 24
+    if steps > 64:
+        steps = 64
+
+    t = t_start
+    for _ in range(steps):
+        d = teapot_sdf_world(ro + rd * t, frame)
+        if d < 0.0015 + 0.0005 * t:
+            return wp.vec2(t, d)
+        t += wp.max(d * 0.8, 0.0015)
+        if t > t_end:
+            break
+    return wp.vec2(-1.0, 0.0)
+
+
+@wp.func
+def shade_teapot(
+    p_world: wp.vec3,
+    n_world: wp.vec3,
+    rd_world: wp.vec3,
+    frame: SceneFrame,
+) -> wp.vec3:
+    n = n_world
+    if wp.dot(n, rd_world) > 0.0:
+        n = -n
+    v = -rd_world
+    cos_theta = wp.max(wp.dot(n, v), 0.0)
+
+    blend = wp.clamp(0.5 + 0.5 * n[1], 0.0, 1.0)
+    albedo = wp.lerp(
+        wp.vec3(0.020, 0.080, 0.450),
+        wp.vec3(0.060, 0.300, 0.950),
+        blend,
+    )
+    f0 = wp.vec3(0.07, 0.13, 0.28)
+    roughness = 0.30
+
+    color = wp.vec3(0.0)
+    color += direct_light_term(n, v, albedo, roughness, f0, frame.light_world0, frame.light_color0, 1.0)
+    color += direct_light_term(n, v, albedo, roughness, f0, frame.light_world1, frame.light_color1, 1.0)
+    color += direct_light_term(n, v, albedo, roughness, f0, frame.light_world2, frame.light_color2, 1.0)
+    color += wp.cw_mul(sky_color(n), albedo) * 0.90
+    color += wp.cw_mul(albedo, frame.ambient_color) * 0.18
+
+    reflected = wp.normalize(rd_world - 2.0 * wp.dot(rd_world, n) * n)
+    fresnel = fresnel_schlick(cos_theta, f0)
+    color += wp.cw_mul(sky_color(reflected), fresnel) * 0.28
+
+    omc = 1.0 - cos_theta
+    color += (omc * omc * omc * omc) * wp.vec3(0.15, 0.35, 0.85) * 0.45
+    return color
+
+
+@wp.func
+def scene_ray_color(
+    origin: wp.vec3,
+    direction: wp.vec3,
+    camera: Camera,
+    frame: SceneFrame,
+    floor_enabled: int,
+    max_steps: int,
+    max_iterations: int,
+) -> wp.vec3:
+    t_floor = floor_intersection(origin, direction)
+    teapot_hit = teapot_intersect(origin, direction, frame, max_steps)
+    teapot_t = teapot_hit[0]
+    if teapot_t > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_t < t_floor):
+        p_teapot = origin + direction * teapot_t
+        n_teapot = teapot_normal_world(p_teapot, frame)
+        return shade_teapot(p_teapot, n_teapot, direction, frame)
+    if floor_enabled != 0 and t_floor > 0.001:
+        return shade_floor(
+            origin + direction * t_floor,
+            direction,
+            t_floor,
+            camera,
+            frame,
+            max_steps,
+            max_iterations,
+        )
+    return background_color(direction, camera.forward)
+
+
+@wp.func
+def glass_light_term(
+    n_world: wp.vec3,
+    v: wp.vec3,
+    light_dir: wp.vec3,
+    light_color: wp.vec3,
+    visibility: float,
+    roughness: float,
+    f0: wp.vec3,
+) -> wp.vec3:
+    if visibility <= 0.0 or wp.dot(light_color, light_color) < 1.0e-12:
+        return wp.vec3(0.0)
+    ndl = wp.max(wp.dot(n_world, light_dir), 0.0)
+    if ndl <= 0.0:
+        return wp.vec3(0.0)
+    return wp.cw_mul(specular_ggx(n_world, v, light_dir, roughness, f0), light_color) * ndl * visibility
+
+
+@wp.func
+def shade_glass(
+    p_world: wp.vec3,
+    n_world: wp.vec3,
+    n_refract_world: wp.vec3,
+    rd_world: wp.vec3,
+    visibility0: float,
+    visibility1: float,
+    visibility2: float,
+    shininess: float,
+    camera: Camera,
+    frame: SceneFrame,
+    floor_enabled: int,
+    max_steps: int,
+    max_iterations: int,
+) -> wp.vec3:
+    n = n_world
+    if wp.dot(n, rd_world) > 0.0:
+        n = -n
+    n_refract = n_refract_world
+    if wp.dot(n_refract, rd_world) > 0.0:
+        n_refract = -n_refract
+    v = -rd_world
+    cos_i = wp.clamp(wp.dot(v, n), 0.0, 1.0)
+    cos_i_refract = wp.clamp(wp.dot(v, n_refract), 0.0, 1.0)
+
+    ior = wp.max(frame.glass_ior, 1.0)
+    eta = 1.0 / ior
+    k = 1.0 - eta * eta * (1.0 - cos_i_refract * cos_i_refract)
+
+    reflect_dir = wp.normalize(rd_world - 2.0 * wp.dot(rd_world, n) * n)
+    reflection = scene_ray_color(
+        p_world + n * 0.002,
+        reflect_dir,
+        camera,
+        frame,
+        floor_enabled,
+        max_steps,
+        max_iterations,
+    )
+
+    if k > 0.0:
+        refract_dir = wp.normalize(
+            eta * rd_world + (eta * cos_i_refract - wp.sqrt(k)) * n_refract
+        )
+    else:
+        refract_dir = reflect_dir
+    transmission = scene_ray_color(
+        p_world - n_refract * 0.002,
+        refract_dir,
+        camera,
+        frame,
+        floor_enabled,
+        max_steps,
+        max_iterations,
+    )
+    straight = scene_ray_color(
+        p_world - n_refract * 0.002,
+        rd_world,
+        camera,
+        frame,
+        floor_enabled,
+        max_steps,
+        max_iterations,
+    )
+    transmission = wp.lerp(transmission, straight, 0.45)
+
+    f0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0))
+    fresnel = f0 + (1.0 - f0) * wp.pow(1.0 - cos_i, 5.0)
+    tint = wp.lerp(wp.vec3(1.0), frame.fractal_color, 0.62)
+    transmission = wp.cw_mul(transmission, tint)
+
+    shine = wp.clamp(shininess, 0.0, 1.0)
+    roughness = wp.max(0.04, 0.42 - 0.34 * shine)
+    spec_f0 = wp.vec3(0.04, 0.04, 0.04) * (0.7 + 0.8 * shine)
+    specular = wp.vec3(0.0)
+    specular += glass_light_term(n, v, frame.light_world0, frame.light_color0, visibility0, roughness, spec_f0)
+    specular += glass_light_term(n, v, frame.light_world1, frame.light_color1, visibility1, roughness, spec_f0)
+    specular += glass_light_term(n, v, frame.light_world2, frame.light_color2, visibility2, roughness, spec_f0)
+
+    color = wp.lerp(transmission, reflection, fresnel)
+    color += specular * (0.8 + 1.4 * shine)
     return color
 
 
@@ -1042,6 +1394,8 @@ def mandelbulb_closest_hit(
         frame.fractal_beta,
     )
     t_hit = hit[0]
+    teapot_hit = teapot_intersect(ro, rd, frame, max_steps)
+    teapot_t = teapot_hit[0]
 
     payload = Payload()
     if t_hit < 0.0:
@@ -1058,6 +1412,10 @@ def mandelbulb_closest_hit(
             )
         else:
             payload.color = background_color(rd, camera.forward)
+        if teapot_t > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_t < t_floor):
+            p_teapot = ro + rd * teapot_t
+            n_teapot = teapot_normal_world(p_teapot, frame)
+            payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     else:
         p_local = ro_local + rd_local * t_hit
         n_local = mandelbulb_normal(
@@ -1098,28 +1456,61 @@ def mandelbulb_closest_hit(
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
             )
-        payload.color = shade_mandelbulb(
-            p_local,
-            n_local,
-            n_world,
-            rd,
-            max_iterations,
-            visibility0,
-            visibility1,
-            visibility2,
-            fractal_shininess,
-            frame.fractal_power,
-            frame.fractal_alpha,
-            frame.fractal_beta,
-            frame.light_color0,
-            frame.light_color1,
-            frame.light_color2,
-            frame.fractal_color,
-            frame.ambient_color,
-            frame.light_world0,
-            frame.light_world1,
-            frame.light_world2,
-        )
+        p_world = ro + rd * t_hit
+        if frame.glass_enabled != 0:
+            n_refract_local = mandelbulb_normal_wide(
+                p_local,
+                hit[1],
+                max_iterations,
+                frame.fractal_power,
+                frame.fractal_alpha,
+                frame.fractal_beta,
+            )
+            n_refract_world = wp.normalize(local_to_world_vec(n_refract_local, frame))
+            if wp.dot(n_refract_world, rd) > 0.0:
+                n_refract_world = -n_refract_world
+            payload.color = shade_glass(
+                p_world,
+                n_world,
+                n_refract_world,
+                rd,
+                visibility0,
+                visibility1,
+                visibility2,
+                fractal_shininess,
+                camera,
+                frame,
+                floor_enabled,
+                max_steps,
+                max_iterations,
+            )
+        else:
+            payload.color = shade_mandelbulb(
+                p_local,
+                n_local,
+                n_world,
+                rd,
+                max_iterations,
+                visibility0,
+                visibility1,
+                visibility2,
+                fractal_shininess,
+                frame.fractal_power,
+                frame.fractal_alpha,
+                frame.fractal_beta,
+                frame.light_color0,
+                frame.light_color1,
+                frame.light_color2,
+                frame.fractal_color,
+                frame.ambient_color,
+                frame.light_world0,
+                frame.light_world1,
+                frame.light_world2,
+            )
+        if teapot_t > 0.0 and teapot_t < t_hit:
+            p_teapot = ro + rd * teapot_t
+            n_teapot = teapot_normal_world(p_teapot, frame)
+            payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     wp.optix_store_payload(payload)
 
 
@@ -1147,6 +1538,12 @@ def miss(
         )
     else:
         payload.color = background_color(rd, camera.forward)
+
+    teapot_hit = teapot_intersect(ro, rd, frame, max_steps)
+    if teapot_hit[0] > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_hit[0] < t_floor):
+        p_teapot = ro + rd * teapot_hit[0]
+        n_teapot = teapot_normal_world(p_teapot, frame)
+        payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     wp.optix_store_payload(payload)
 
 
@@ -1309,6 +1706,11 @@ class MandelbulbRenderer:
         fractal_rgb=FRACTAL_COLOR_DEFAULT,
         ambient_rgb=AMBIENT_COLOR_DEFAULT,
         light_angles=(0.0, 0.0, 0.0),
+        glass_enabled: bool = False,
+        glass_ior: float = GLASS_IOR_DEFAULT,
+        teapot_active: bool = False,
+        teapot_pos=(0.0, 0.0, 0.0),
+        teapot_yaw: float = 0.0,
     ) -> np.ndarray:
         self.update(t)
         return self.render(
@@ -1321,6 +1723,11 @@ class MandelbulbRenderer:
             fractal_rgb,
             ambient_rgb,
             light_angles,
+            glass_enabled,
+            glass_ior,
+            teapot_active,
+            teapot_pos,
+            teapot_yaw,
         )
 
     def render(
@@ -1334,6 +1741,11 @@ class MandelbulbRenderer:
         fractal_rgb=FRACTAL_COLOR_DEFAULT,
         ambient_rgb=AMBIENT_COLOR_DEFAULT,
         light_angles=(0.0, 0.0, 0.0),
+        glass_enabled: bool = False,
+        glass_ior: float = GLASS_IOR_DEFAULT,
+        teapot_active: bool = False,
+        teapot_pos=(0.0, 0.0, 0.0),
+        teapot_yaw: float = 0.0,
     ) -> np.ndarray:
         quality = QUALITY_PRESETS[self.quality_index]
         frame = make_scene_frame(
@@ -1346,6 +1758,11 @@ class MandelbulbRenderer:
             fractal_rgb,
             ambient_rgb,
             light_angles,
+            glass_enabled,
+            glass_ior,
+            teapot_active,
+            teapot_pos,
+            teapot_yaw,
         )
         with wp.ScopedDevice(self.device):
             wo.launch(
@@ -1397,13 +1814,24 @@ class QualitySlider:
         "Animate: checkbox + own min/max/speed",
     )
 
-    def __init__(self, index: int, floor_enabled: bool = True, shininess: float = 0.4):
+    def __init__(
+        self,
+        index: int,
+        floor_enabled: bool = True,
+        shininess: float = 0.4,
+        glass_enabled: bool = False,
+        glass_ior: float = GLASS_IOR_DEFAULT,
+    ):
         self.index = min(max(index, 0), MAX_QUALITY_INDEX)
         self.floor_enabled = bool(floor_enabled)
         self.shininess = min(max(float(shininess), 0.0), 1.0)
+        self.glass_enabled = bool(glass_enabled)
+        self.glass_ior = min(max(float(glass_ior), GLASS_IOR_MIN), GLASS_IOR_MAX)
         self.panel_rect = None
         self.track_rect = None
         self.shine_rect = None
+        self.glass_rect = None
+        self.glass_ior_rect = None
         self.floor_rect = None
         self._panel_surface = None
         self._static = None
@@ -1417,7 +1845,12 @@ class QualitySlider:
         track_x = panel_x + 14
         track_w = panel_w - 28
         self.track_rect = (track_x, panel_y + 32 - 8, track_w, 16)
-        self.shine_rect = (track_x, panel_y + 84 - 8, track_w, 16)
+        material_gap = 22
+        material_w = max(72, (track_w - material_gap) // 2)
+        glass_x = track_x + material_w + material_gap
+        self.shine_rect = (track_x, panel_y + 84 - 8, material_w, 16)
+        self.glass_ior_rect = (glass_x, panel_y + 84 - 8, material_w, 16)
+        self.glass_rect = (glass_x, panel_y + 63, 16, 16)
         self.floor_rect = (panel_x + 14, panel_y + 98, 18, 18)
         self._panel_surface = None
 
@@ -1439,6 +1872,15 @@ class QualitySlider:
 
     def hit_shininess(self, pos: tuple[int, int]) -> bool:
         return self._rect_hit(self.shine_rect, pos)
+
+    def hit_glass(self, pos: tuple[int, int]) -> bool:
+        if self.glass_rect is None:
+            return False
+        x, y, w, h = self.glass_rect
+        return x - 5 <= pos[0] <= x + w + 5 and y <= pos[1] <= y + h
+
+    def hit_glass_ior(self, pos: tuple[int, int]) -> bool:
+        return self._rect_hit(self.glass_ior_rect, pos)
 
     def hit_floor(self, pos: tuple[int, int]) -> bool:
         if self.floor_rect is None:
@@ -1469,6 +1911,15 @@ class QualitySlider:
         self.shininess = value
         return changed
 
+    def set_glass_ior_from_x(self, x_pos: float) -> bool:
+        if self.glass_ior_rect is None:
+            return False
+        value = self._value_from_x(self.glass_ior_rect, x_pos, GLASS_IOR_MIN, GLASS_IOR_MAX)
+        value = round(value, 2)
+        changed = abs(value - self.glass_ior) > 1.0e-4
+        self.glass_ior = value
+        return changed
+
     def draw(self, screen, font, small_font, width: int):
         import pygame
 
@@ -1484,7 +1935,8 @@ class QualitySlider:
         if self._static is None:
             self._static = {
                 "quality": font.render("Render quality", True, (230, 237, 247)),
-                "shininess": font.render("Fractal shininess", True, (230, 237, 247)),
+                "shininess": font.render("Shininess", True, (230, 237, 247)),
+                "glass": font.render("Glass", True, (230, 237, 247)),
                 "floor": small_font.render("Checkered floor", True, (220, 230, 242)),
                 "floor_key": small_font.render("F", True, (124, 226, 185)),
                 "help": [small_font.render(line, True, (166, 180, 198)) for line in self.HELP_LINES],
@@ -1519,8 +1971,38 @@ class QualitySlider:
         screen.blit(static["shininess"], (x + 14, y + 62))
         shine_pct = int(round(self.shininess * 100.0))
         sv = font.render(f"{shine_pct}%", True, (238, 185, 103))
-        screen.blit(sv, (x + w - sv.get_width() - 14, y + 62))
+        screen.blit(sv, (self.shine_rect[0] + self.shine_rect[2] - sv.get_width(), y + 62))
         draw_track(self.shine_rect, self.shininess, (224, 173, 94), knob_color=(245, 243, 236), knob_dark=(54, 40, 24))
+
+        gx, gy, gw, gh = self.glass_rect
+        pygame.draw.rect(screen, (48, 60, 74), (gx, gy, gw, gh), border_radius=4)
+        pygame.draw.rect(screen, (118, 136, 158), (gx, gy, gw, gh), 1, border_radius=4)
+        if self.glass_enabled:
+            pygame.draw.rect(screen, (93, 202, 169), (gx + 1, gy + 1, gw - 2, gh - 2), border_radius=3)
+            pygame.draw.rect(screen, (155, 230, 202), (gx, gy, gw, gh), 1, border_radius=4)
+            pygame.draw.lines(
+                screen,
+                (12, 32, 30),
+                False,
+                [(gx + 3, gy + 8), (gx + 7, gy + 12), (gx + 13, gy + 4)],
+                2,
+            )
+        screen.blit(static["glass"], (gx + 20, y + 62))
+        ior_text = font.render(
+            f"{self.glass_ior:.2f}",
+            True,
+            (115, 205, 255) if self.glass_enabled else (130, 144, 162),
+        )
+        screen.blit(
+            ior_text,
+            (self.glass_ior_rect[0] + self.glass_ior_rect[2] - ior_text.get_width(), y + 62),
+        )
+        ior_t = (self.glass_ior - GLASS_IOR_MIN) / (GLASS_IOR_MAX - GLASS_IOR_MIN)
+        draw_track(
+            self.glass_ior_rect,
+            ior_t,
+            (115, 205, 255) if self.glass_enabled else (58, 68, 84),
+        )
 
         bx, by, bw, bh = self.floor_rect
         pygame.draw.rect(screen, (59, 72, 88), (bx, by, bw, bh), border_radius=4)
@@ -2283,6 +2765,50 @@ class FractalParamsPanel:
                 speed_t = (st["speed"] - self.SPEED_MIN) / (self.SPEED_MAX - self.SPEED_MIN)
                 draw_track(row["speed_track"], speed_t, (115, 205, 255))
 
+class TeapotEasterEgg:
+    DURATION_FRAMES = 240
+    ORBIT_RADIUS = 2.2
+    ORBIT_PERIOD_FRAMES = 150.0
+    BOUNCE_PERIOD_FRAMES = 58.0
+    BOUNCE_HEIGHT = 0.90
+
+    def __init__(self):
+        self.active = False
+        self.frames_left = 0
+        self.age = 0
+        self.pos = (0.0, FLOOR_Y, 0.0)
+        self.yaw = 0.0
+
+    def spawn(self):
+        self.active = True
+        self.frames_left = self.DURATION_FRAMES
+        self.age = 0
+        self._update_state()
+
+    def _update_state(self):
+        angle = self.age * (2.0 * math.pi / self.ORBIT_PERIOD_FRAMES)
+        bounce = abs(math.sin(self.age * (2.0 * math.pi / self.BOUNCE_PERIOD_FRAMES))) * self.BOUNCE_HEIGHT
+        self.pos = (
+            math.cos(angle) * self.ORBIT_RADIUS,
+            FLOOR_Y + bounce,
+            math.sin(angle) * self.ORBIT_RADIUS,
+        )
+        self.yaw = angle + math.pi * 0.5
+
+    def update(self):
+        if not self.active:
+            return
+        self.age += 1
+        self.frames_left -= 1
+        if self.frames_left < 0:
+            self.active = False
+            return
+        self._update_state()
+
+    def state(self):
+        return bool(self.active), self.pos, self.yaw
+
+
 def run_interactive(args) -> int:
     import pygame
 
@@ -2301,6 +2827,8 @@ def run_interactive(args) -> int:
         renderer.quality_index,
         floor_enabled,
         args.shininess / 100.0,
+        args.glass,
+        args.ior,
     )
     slider.layout(width, height)
     lights = LightsPanel(
@@ -2316,6 +2844,7 @@ def run_interactive(args) -> int:
     lights.layout(width, height)
     params = FractalParamsPanel(args.power, args.alpha, args.beta)
     params.layout(width, height)
+    easter_egg = TeapotEasterEgg()
 
     slider_font = pygame.font.Font(None, 19)
     slider_small = pygame.font.Font(None, 15)
@@ -2374,6 +2903,7 @@ def run_interactive(args) -> int:
                     scene_dirty = True
                 elif event.key == pygame.K_s:
                     t_save = paused_time if paused else time.perf_counter() - start
+                    teapot_active, teapot_pos, teapot_yaw = easter_egg.state()
                     renderer.camera = camera.camera()
                     save_png(
                         renderer.render_still(
@@ -2387,6 +2917,11 @@ def run_interactive(args) -> int:
                             lights.fractal_state(),
                             lights.ambient_state(),
                             lights.orbit_state(),
+                            slider.glass_enabled,
+                            slider.glass_ior,
+                            teapot_active,
+                            teapot_pos,
+                            teapot_yaw,
                         ),
                         Path("proj_mndlblb.png"),
                     )
@@ -2396,6 +2931,8 @@ def run_interactive(args) -> int:
                 elif event.key == pygame.K_h:
                     panels_visible = not panels_visible
                     dragging = None
+                elif event.key == pygame.K_b and (event.mod & pygame.KMOD_SHIFT):
+                    easter_egg.spawn()
                 elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
                     camera.zoom(1.0)
                     scene_dirty = True
@@ -2495,9 +3032,17 @@ def run_interactive(args) -> int:
                             slider.floor_enabled = not slider.floor_enabled
                             dragging = None
                             scene_dirty = True
+                        elif slider.hit_glass(event.pos):
+                            slider.glass_enabled = not slider.glass_enabled
+                            dragging = None
+                            scene_dirty = True
                         elif slider.hit_shininess(event.pos):
                             dragging = "shininess"
                             if slider.set_shininess_from_x(float(event.pos[0])):
+                                scene_dirty = True
+                        elif slider.hit_glass_ior(event.pos):
+                            dragging = "glass_ior"
+                            if slider.set_glass_ior_from_x(float(event.pos[0])):
                                 scene_dirty = True
                         elif slider.hit(event.pos):
                             dragging = "quality"
@@ -2526,6 +3071,9 @@ def run_interactive(args) -> int:
                         scene_dirty = True
                 elif dragging == "shininess":
                     if slider.set_shininess_from_x(float(event.pos[0])):
+                        scene_dirty = True
+                elif dragging == "glass_ior":
+                    if slider.set_glass_ior_from_x(float(event.pos[0])):
                         scene_dirty = True
                 elif dragging is not None and dragging.startswith("lights_"):
                     _, light_index, channel = dragging.split("_")
@@ -2591,11 +3139,17 @@ def run_interactive(args) -> int:
             params.advance_animation(dt)
             lights.advance_orbit(dt)
 
+        teapot_was_active = easter_egg.active
+        easter_egg.update()
+        if teapot_was_active and not easter_egg.active:
+            scene_dirty = True
+
         now = paused_time if paused else time.perf_counter() - start
-        if not paused or scene_dirty or pixels is None:
+        if not paused or scene_dirty or pixels is None or easter_egg.active:
             if not paused:
                 renderer.update(now)
             renderer.camera = camera.camera()
+            teapot_active, teapot_pos, teapot_yaw = easter_egg.state()
             pixels = renderer.render(
                 slider.floor_enabled,
                 slider.shininess,
@@ -2606,6 +3160,11 @@ def run_interactive(args) -> int:
                 lights.fractal_state(),
                 lights.ambient_state(),
                 lights.orbit_state(),
+                slider.glass_enabled,
+                slider.glass_ior,
+                teapot_active,
+                teapot_pos,
+                teapot_yaw,
             )
             scene_dirty = False
 
@@ -2689,6 +3248,13 @@ def main() -> int:
     parser.add_argument("--ambient-r", type=float, default=AMBIENT_COLOR_DEFAULT[0], help="ambient light red channel, 0..1")
     parser.add_argument("--ambient-g", type=float, default=AMBIENT_COLOR_DEFAULT[1], help="ambient light green channel, 0..1")
     parser.add_argument("--ambient-b", type=float, default=AMBIENT_COLOR_DEFAULT[2], help="ambient light blue channel, 0..1")
+    parser.add_argument("--glass", action="store_true", help="start with glass refraction enabled")
+    parser.add_argument(
+        "--ior",
+        type=float,
+        default=GLASS_IOR_DEFAULT,
+        help=f"glass index of refraction, {GLASS_IOR_MIN:g}..{GLASS_IOR_MAX:g}",
+    )
     args = parser.parse_args()
 
     if args.width < 1 or args.height < 1:
@@ -2703,6 +3269,8 @@ def main() -> int:
         parser.error(f"--alpha must be between {ANGLE_MIN:g} and {ANGLE_MAX:g}")
     if not ANGLE_MIN <= args.beta <= ANGLE_MAX:
         parser.error(f"--beta must be between {ANGLE_MIN:g} and {ANGLE_MAX:g}")
+    if not GLASS_IOR_MIN <= args.ior <= GLASS_IOR_MAX:
+        parser.error(f"--ior must be between {GLASS_IOR_MIN:g} and {GLASS_IOR_MAX:g}")
     for prefix in ("light", "fill", "rim", "fractal", "ambient"):
         for channel in ("r", "g", "b"):
             value = getattr(args, f"{prefix}_{channel}")
@@ -2733,6 +3301,9 @@ def main() -> int:
             light_state,
             (args.fractal_r, args.fractal_g, args.fractal_b),
             (args.ambient_r, args.ambient_g, args.ambient_b),
+            (0.0, 0.0, 0.0),
+            args.glass,
+            args.ior,
         )
         save_png(pixels, args.still)
         print(f"Rendered in {time.perf_counter() - t0:.2f}s")

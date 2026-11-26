@@ -1,7 +1,8 @@
 # Mandelbulb OptiX
 
 Real-time Mandelbulb ray marcher with a checkered floor, shadowed directional
-lights, live material controls, and independently animated fractal parameters.
+lights, live material controls, optional glass refraction, and independently
+animated fractal parameters.
 
 The renderer uses NVIDIA OptiX through Warp. It needs a CUDA-capable NVIDIA
 GPU with an installed OptiX runtime.
@@ -86,8 +87,15 @@ floor; the procedural sky background stays fixed.
 | Control | Description |
 |---|---|
 | Render quality | Preset `1–10`; higher is slower and cleaner |
-| Fractal shininess | Material glossiness, `0–100%` |
+| Shininess | Material glossiness, `0–100%` |
+| Glass | Switch the fractal to refractive glass |
+| Glass IOR | Index of refraction, `1.00–2.00`; default `1.45` |
 | Checkered floor | Floor visibility checkbox, same as the `F` key |
+
+Glass mode approximates air-to-glass refraction using the refracted floor/sky
+color and a Fresnel reflection. It does not trace the fractal's far side, but
+it does tint the transmission with the Fractal RGB color and softens the
+fractal's floor shadow.
 
 Quality presets:
 
@@ -152,6 +160,8 @@ Displays the current frame rate. It remains visible when panels are hidden.
 | `--rim-light` | off | Start with the rim light enabled |
 | `--fractal-r/g/b` | `1.0 / 1.0 / 1.0` | Fractal color tint, normalized `0–1` |
 | `--ambient-r/g/b` | `1.0 / 1.0 / 1.0` | Ambient light color, normalized `0–1` |
+| `--glass` | off | Start with glass refraction enabled |
+| `--ior` | `1.45` | Glass index of refraction, `1.0–2.0` |
 | `-h`, `--help` | | Show CLI help |
 
 Notes:
