@@ -116,6 +116,20 @@ FLOOR_Y = -2.1
 FLOOR_CELL = 1.2
 TEAPOT_SCALE = 0.72
 
+
+def _mandelbulb_bound_radius(power: float) -> float:
+    # Solve r**power - r = escape_radius for the first-iteration escape bound.
+    # Angle offsets only rotate the result, so this is conservative for all
+    # alpha/beta values.  A small margin protects against float rounding.
+    lo, hi = 1.0, BOUND_RADIUS
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if mid**power - mid < BOUND_RADIUS:
+            lo = mid
+        else:
+            hi = mid
+    return min(BOUND_RADIUS, hi * 1.2)
+
 POWER_MIN = 2.0
 POWER_MAX = 16.0
 POWER_DEFAULT = 8.0
@@ -278,6 +292,12 @@ class SceneFrame:
     fractal_power: float
     fractal_alpha: float
     fractal_beta: float
+    bound_radius: float
+    bound_radius_sq: float
+    alpha8_cos: float
+    alpha8_sin: float
+    beta8_cos: float
+    beta8_sin: float
 
 
 @wp.struct
@@ -381,6 +401,13 @@ def make_scene_frame(
     frame.fractal_power = float(power)
     frame.fractal_alpha = float(alpha)
     frame.fractal_beta = float(beta)
+    bound_radius = _mandelbulb_bound_radius(float(power))
+    frame.bound_radius = bound_radius
+    frame.bound_radius_sq = bound_radius * bound_radius
+    frame.alpha8_cos = math.cos(8.0 * float(alpha))
+    frame.alpha8_sin = math.sin(8.0 * float(alpha))
+    frame.beta8_cos = math.cos(8.0 * float(beta))
+    frame.beta8_sin = math.sin(8.0 * float(beta))
     return frame
 
 
@@ -489,7 +516,14 @@ def local_to_world_vec(v: wp.vec3, frame: SceneFrame) -> wp.vec3:
 # Mandelbulb distance estimator (classic power 8, trig-free)
 # ---------------------------------------------------------------------------
 @wp.func
-def mandelbulb_de_fast(p_local: wp.vec3, max_iterations: int) -> float:
+def mandelbulb_de_fast(
+    p_local: wp.vec3,
+    max_iterations: int,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
+) -> float:
     # Local world uses Y up; the classic Mandelbulb formula uses Z as its
     # symmetry axis, so swap Y and Z before evaluating the formula.
     c = wp.vec3(p_local[0], p_local[2], p_local[1])
@@ -529,8 +563,10 @@ def mandelbulb_de_fast(p_local: wp.vec3, max_iterations: int) -> float:
         st2 = (2.0 * zz * rxy) * inv_r2
         ct4 = ct2 * ct2 - st2 * st2
         st4 = 2.0 * ct2 * st2
-        ct8 = ct4 * ct4 - st4 * st4
-        st8 = 2.0 * ct4 * st4
+        ct8_raw = ct4 * ct4 - st4 * st4
+        st8_raw = 2.0 * ct4 * st4
+        ct8 = ct8_raw * beta8_cos - st8_raw * beta8_sin
+        st8 = st8_raw * beta8_cos + ct8_raw * beta8_sin
 
         if w > 1.0e-24:
             inv_w = 1.0 / w
@@ -538,11 +574,14 @@ def mandelbulb_de_fast(p_local: wp.vec3, max_iterations: int) -> float:
             s2 = (2.0 * x * y) * inv_w
             c4 = c2 * c2 - s2 * s2
             s4 = 2.0 * c2 * s2
-            c8 = c4 * c4 - s4 * s4
-            s8 = 2.0 * c4 * s4
+            c8_raw = c4 * c4 - s4 * s4
+            s8_raw = 2.0 * c4 * s4
         else:
-            c8 = 1.0
-            s8 = 0.0
+            c8_raw = 1.0
+            s8_raw = 0.0
+
+        c8 = c8_raw * alpha8_cos - s8_raw * alpha8_sin
+        s8 = s8_raw * alpha8_cos + c8_raw * alpha8_sin
 
         z = wp.vec3(st8 * c8, st8 * s8, ct8) * r8 + c
 
@@ -598,10 +637,21 @@ def mandelbulb_de(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> float:
-    # Keep the fast trig-free path for the default classic bulb.
-    if wp.abs(power - 8.0) < 1.0e-5 and wp.abs(alpha) < 1.0e-7 and wp.abs(beta) < 1.0e-7:
-        return mandelbulb_de_fast(p_local, max_iterations)
+    # The power-8 path stays trig-free for any alpha/beta offset.
+    if wp.abs(power - 8.0) < 1.0e-5:
+        return mandelbulb_de_fast(
+            p_local,
+            max_iterations,
+            alpha8_cos,
+            alpha8_sin,
+            beta8_cos,
+            beta8_sin,
+        )
     return mandelbulb_de_generic(p_local, max_iterations, power, alpha, beta)
 
 
@@ -616,14 +666,28 @@ def march_mandelbulb(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> wp.vec2:
     t = t_enter + 0.0005
     for _ in range(max_steps):
         p = ro_local + rd_local * t
-        d = mandelbulb_de(p, max_iterations, power, alpha, beta)
+        d = mandelbulb_de(
+            p,
+            max_iterations,
+            power,
+            alpha,
+            beta,
+            alpha8_cos,
+            alpha8_sin,
+            beta8_cos,
+            beta8_sin,
+        )
         if d < 0.0004 + 0.00055 * t:
             return wp.vec2(t, d)
-        t += wp.max(d * 0.85, 0.0002)
+        t += d * 0.85
         if t >= t_exit:
             break
     return wp.vec2(-1.0, 0.0)
@@ -639,16 +703,22 @@ def mandelbulb_shadow(
     power: float,
     alpha: float,
     beta: float,
+    bound_radius: float,
+    bound_radius_sq: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> float:
     ro = p_local + n_local * 0.003
 
-    # Intersect shadow ray against the Mandelbulb bounding sphere (unit rd).
+    # Intersect shadow ray against the dynamic Mandelbulb bounding sphere.
     t_c = -wp.dot(ro, light_dir_local)
     closest = ro + light_dir_local * t_c
     d2 = wp.dot(closest, closest)
-    if d2 > BOUND_RADIUS_SQ:
+    if d2 > bound_radius_sq:
         return 1.0
-    half_chord = wp.sqrt(BOUND_RADIUS_SQ - d2)
+    half_chord = wp.sqrt(wp.max(bound_radius_sq - d2, 0.0))
     t_start = wp.max(0.01, t_c - half_chord)
     t_end = wp.min(3.0, t_c + half_chord)
     if t_start >= t_end:
@@ -656,7 +726,17 @@ def mandelbulb_shadow(
 
     t = t_start
     for _ in range(max_steps):
-        d = mandelbulb_de(ro + light_dir_local * t, max_iterations, power, alpha, beta)
+        d = mandelbulb_de(
+            ro + light_dir_local * t,
+            max_iterations,
+            power,
+            alpha,
+            beta,
+            alpha8_cos,
+            alpha8_sin,
+            beta8_cos,
+            beta8_sin,
+        )
         if d < 0.0015 + 0.0005 * t:
             return 0.0
         t += wp.max(d * 0.9, 0.0015)
@@ -673,11 +753,15 @@ def mandelbulb_normal(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> wp.vec3:
     h = 0.0015
-    gx = mandelbulb_de(p_local + wp.vec3(h, 0.0, 0.0), max_iterations, power, alpha, beta) - d0
-    gy = mandelbulb_de(p_local + wp.vec3(0.0, h, 0.0), max_iterations, power, alpha, beta) - d0
-    gz = mandelbulb_de(p_local + wp.vec3(0.0, 0.0, h), max_iterations, power, alpha, beta) - d0
+    gx = mandelbulb_de(p_local + wp.vec3(h, 0.0, 0.0), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
+    gy = mandelbulb_de(p_local + wp.vec3(0.0, h, 0.0), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
+    gz = mandelbulb_de(p_local + wp.vec3(0.0, 0.0, h), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
     n = wp.vec3(gx, gy, gz)
     length = wp.length(n)
     if length < 1.0e-9:
@@ -693,11 +777,15 @@ def mandelbulb_normal_wide(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> wp.vec3:
     h = 0.015
-    gx = mandelbulb_de(p_local + wp.vec3(h, 0.0, 0.0), max_iterations, power, alpha, beta) - d0
-    gy = mandelbulb_de(p_local + wp.vec3(0.0, h, 0.0), max_iterations, power, alpha, beta) - d0
-    gz = mandelbulb_de(p_local + wp.vec3(0.0, 0.0, h), max_iterations, power, alpha, beta) - d0
+    gx = mandelbulb_de(p_local + wp.vec3(h, 0.0, 0.0), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
+    gy = mandelbulb_de(p_local + wp.vec3(0.0, h, 0.0), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
+    gz = mandelbulb_de(p_local + wp.vec3(0.0, 0.0, h), max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin) - d0
     n = wp.vec3(gx, gy, gz)
     length = wp.length(n)
     if length < 1.0e-9:
@@ -713,10 +801,14 @@ def cavity_ao(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
 ) -> float:
-    d1 = mandelbulb_de(p_local + n_local * 0.025, max_iterations, power, alpha, beta)
-    d2 = mandelbulb_de(p_local + n_local * 0.075, max_iterations, power, alpha, beta)
-    d3 = mandelbulb_de(p_local + n_local * 0.18, max_iterations, power, alpha, beta)
+    d1 = mandelbulb_de(p_local + n_local * 0.025, max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin)
+    d2 = mandelbulb_de(p_local + n_local * 0.075, max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin)
+    d3 = mandelbulb_de(p_local + n_local * 0.18, max_iterations, power, alpha, beta, alpha8_cos, alpha8_sin, beta8_cos, beta8_sin)
     occ = 1.0 - wp.clamp(d1 / 0.025, 0.0, 1.0)
     occ += 0.65 * (1.0 - wp.clamp(d2 / 0.075, 0.0, 1.0))
     occ += 0.35 * (1.0 - wp.clamp(d3 / 0.18, 0.0, 1.0))
@@ -813,6 +905,10 @@ def shade_mandelbulb(
     power: float,
     alpha: float,
     beta: float,
+    alpha8_cos: float,
+    alpha8_sin: float,
+    beta8_cos: float,
+    beta8_sin: float,
     light_color0: wp.vec3,
     light_color1: wp.vec3,
     light_color2: wp.vec3,
@@ -824,7 +920,18 @@ def shade_mandelbulb(
 ) -> wp.vec3:
     v = -rd_world
     cos_theta = wp.max(wp.dot(n_world, v), 0.0)
-    ao = cavity_ao(p_local, n_local, max_iterations, power, alpha, beta)
+    ao = cavity_ao(
+        p_local,
+        n_local,
+        max_iterations,
+        power,
+        alpha,
+        beta,
+        alpha8_cos,
+        alpha8_sin,
+        beta8_cos,
+        beta8_sin,
+    )
 
     # A dark bronze body with a warm metallic specular response.  The small
     # normal-driven blend keeps the intricate surface from reading as one
@@ -915,18 +1022,27 @@ def shade_floor(
                 p_local, frame.floor_n_local, frame.light_local0,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
         if wp.dot(frame.light_color1, frame.light_color1) > 1.0e-12 and wp.dot(n, frame.light_world1) > 0.0:
             visibility1 = mandelbulb_shadow(
                 p_local, frame.floor_n_local, frame.light_local1,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
         if wp.dot(frame.light_color2, frame.light_color2) > 1.0e-12 and wp.dot(n, frame.light_world2) > 0.0:
             visibility2 = mandelbulb_shadow(
                 p_local, frame.floor_n_local, frame.light_local2,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
 
     if frame.glass_enabled != 0:
@@ -1293,14 +1409,29 @@ def raygen(
         )
 
         payload = Payload()
-        wp.optix_trace(
-            scene,
-            camera.position,
-            direction,
-            1.0e6,
-            payload,
-            0.001,
-        )
+        ro = camera.position
+        ray_b = wp.dot(ro, direction)
+        ray_c = wp.dot(ro, ro) - frame.bound_radius_sq
+        bound_disc = ray_b * ray_b - ray_c
+        if bound_disc < 0.0 or (-ray_b + wp.sqrt(bound_disc)) < 0.001:
+            payload.color = scene_ray_color(
+                ro,
+                direction,
+                camera,
+                frame,
+                floor_enabled,
+                max_steps,
+                max_iterations,
+            )
+        else:
+            wp.optix_trace(
+                scene,
+                ro,
+                direction,
+                1.0e6,
+                payload,
+                0.001,
+            )
         pixel_color += payload.color
 
     # Vignette + sample normalization + exposure.
@@ -1382,20 +1513,29 @@ def mandelbulb_closest_hit(
 
     ro_local = world_to_local_vec(ro, frame)
     rd_local = world_to_local_vec(rd, frame)
-    hit = march_mandelbulb(
-        ro_local,
-        rd_local,
-        t_enter,
-        t_exit,
-        max_steps,
-        max_iterations,
-        frame.fractal_power,
-        frame.fractal_alpha,
-        frame.fractal_beta,
-    )
-    t_hit = hit[0]
+
+    hit = wp.vec2(-1.0, 0.0)
     teapot_hit = teapot_intersect(ro, rd, frame, max_steps)
     teapot_t = teapot_hit[0]
+    if teapot_t <= 0.0 or teapot_t > t_enter:
+        if teapot_t > 0.0:
+            t_exit = wp.min(t_exit, teapot_t)
+        hit = march_mandelbulb(
+            ro_local,
+            rd_local,
+            t_enter,
+            t_exit,
+            max_steps,
+            max_iterations,
+            frame.fractal_power,
+            frame.fractal_alpha,
+            frame.fractal_beta,
+            frame.alpha8_cos,
+            frame.alpha8_sin,
+            frame.beta8_cos,
+            frame.beta8_sin,
+        )
+    t_hit = hit[0]
 
     payload = Payload()
     t_floor = -1.0
@@ -1433,6 +1573,10 @@ def mandelbulb_closest_hit(
             frame.fractal_power,
             frame.fractal_alpha,
             frame.fractal_beta,
+            frame.alpha8_cos,
+            frame.alpha8_sin,
+            frame.beta8_cos,
+            frame.beta8_sin,
         )
         n_world = wp.normalize(local_to_world_vec(n_local, frame))
         if wp.dot(n_world, rd) > 0.0:
@@ -1451,18 +1595,27 @@ def mandelbulb_closest_hit(
                 p_local, n_local, frame.light_local0,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
         if wp.dot(frame.light_color1, frame.light_color1) > 1.0e-12 and wp.dot(n_world, frame.light_world1) > 0.0:
             visibility1 = mandelbulb_shadow(
                 p_local, n_local, frame.light_local1,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
         if wp.dot(frame.light_color2, frame.light_color2) > 1.0e-12 and wp.dot(n_world, frame.light_world2) > 0.0:
             visibility2 = mandelbulb_shadow(
                 p_local, n_local, frame.light_local2,
                 shadow_steps, max_iterations,
                 frame.fractal_power, frame.fractal_alpha, frame.fractal_beta,
+                BOUND_RADIUS, BOUND_RADIUS_SQ,
+                frame.alpha8_cos, frame.alpha8_sin,
+                frame.beta8_cos, frame.beta8_sin,
             )
         p_world = ro + rd * t_hit
         if frame.glass_enabled != 0:
@@ -1473,6 +1626,10 @@ def mandelbulb_closest_hit(
                 frame.fractal_power,
                 frame.fractal_alpha,
                 frame.fractal_beta,
+                frame.alpha8_cos,
+                frame.alpha8_sin,
+                frame.beta8_cos,
+                frame.beta8_sin,
             )
             n_refract_world = wp.normalize(local_to_world_vec(n_refract_local, frame))
             if wp.dot(n_refract_world, rd) > 0.0:
@@ -1506,6 +1663,10 @@ def mandelbulb_closest_hit(
                 frame.fractal_power,
                 frame.fractal_alpha,
                 frame.fractal_beta,
+                frame.alpha8_cos,
+                frame.alpha8_sin,
+                frame.beta8_cos,
+                frame.beta8_sin,
                 frame.light_color0,
                 frame.light_color1,
                 frame.light_color2,
@@ -1803,6 +1964,20 @@ def _pack_rgb(packed: np.ndarray) -> np.ndarray:
     )
 
 
+_TEXT_CACHE = {}
+
+
+def _render_text(font, text: str, color):
+    key = (id(font), text, color)
+    surface = _TEXT_CACHE.get(key)
+    if surface is None:
+        surface = font.render(text, True, color)
+        if len(_TEXT_CACHE) >= 2048:
+            _TEXT_CACHE.clear()
+        _TEXT_CACHE[key] = surface
+    return surface
+
+
 def save_png(packed: np.ndarray, path: Path):
     from PIL import Image
 
@@ -1961,10 +2136,10 @@ class QualitySlider:
         static = self._static
         screen.blit(static["quality"], (x + 14, y + 8))
         q = QUALITY_PRESETS[self.index]
-        qv = font.render(f"{self.index + 1}/{len(QUALITY_PRESETS)}", True, (124, 226, 185))
-        qd = small_font.render(
+        qv = _render_text(font, f"{self.index + 1}/{len(QUALITY_PRESETS)}", (124, 226, 185))
+        qd = _render_text(
+            small_font,
             f"{q.samples} spp  ·  {q.steps} steps  ·  {q.iterations} iterations",
-            True,
             (172, 184, 201),
         )
         screen.blit(qv, (x + w - qv.get_width() - 14, y + 8))
@@ -1974,7 +2149,7 @@ class QualitySlider:
 
         screen.blit(static["shininess"], (x + 14, y + 62))
         shine_pct = int(round(self.shininess * 100.0))
-        sv = font.render(f"{shine_pct}%", True, (238, 185, 103))
+        sv = _render_text(font, f"{shine_pct}%", (238, 185, 103))
         screen.blit(sv, (self.shine_rect[0] + self.shine_rect[2] - sv.get_width(), y + 62))
         draw_track(self.shine_rect, self.shininess, (224, 173, 94), knob_color=(245, 243, 236), knob_dark=(54, 40, 24))
 
@@ -1992,9 +2167,9 @@ class QualitySlider:
                 2,
             )
         screen.blit(static["glass"], (gx + 20, y + 62))
-        ior_text = font.render(
+        ior_text = _render_text(
+            font,
             f"{self.glass_ior:.2f}",
-            True,
             (115, 205, 255) if self.glass_enabled else (130, 144, 162),
         )
         screen.blit(
@@ -2342,9 +2517,9 @@ class LightsPanel:
                     value_text = str(int(round(self.colors[i][j] * 100.0)))
                     accent = accents[j] if enabled else (58, 68, 84)
                 screen.blit(label_surf, (rx, top + 18))
-                vtxt = small_font.render(
+                vtxt = _render_text(
+                    small_font,
                     value_text,
-                    True,
                     (214, 226, 240) if active else (130, 144, 162),
                 )
                 screen.blit(vtxt, (rx + col_w - vtxt.get_width(), top + 18))
@@ -2357,7 +2532,7 @@ class LightsPanel:
                 rx = rect[0]
                 screen.blit(self._static["rgb"][j], (rx, row["top"] + 18))
                 value = int(round(rgb[j] * 100.0))
-                vtxt = small_font.render(str(value), True, (214, 226, 240) if enabled else (130, 144, 162))
+                vtxt = _render_text(small_font, str(value), (214, 226, 240) if enabled else (130, 144, 162))
                 screen.blit(vtxt, (rx + col_w - vtxt.get_width(), row["top"] + 18))
                 draw_track(rect, rgb[j], accents[j] if enabled else (58, 68, 84))
 
@@ -2680,7 +2855,7 @@ class FractalParamsPanel:
             self._panel_surface = panel
         screen.blit(self._panel_surface, (x, y))
 
-        title = font.render("Fractal parameters", True, (230, 237, 247))
+        title = _render_text(font, "Fractal parameters", (230, 237, 247))
         screen.blit(title, (x + 14, y + 7))
 
         def draw_checkbox(rect, enabled, accent):
@@ -2718,8 +2893,8 @@ class FractalParamsPanel:
             top = row["top"]
             draw_checkbox(row["check"], st["enabled"], accent)
 
-            label_surf = font.render(label, True, (218, 228, 240))
-            value_surf = font.render(self._fmt(key, self._value(key)), True, accent)
+            label_surf = _render_text(font, label, (218, 228, 240))
+            value_surf = _render_text(font, self._fmt(key, self._value(key)), accent)
             screen.blit(label_surf, (x + 38, top))
             screen.blit(value_surf, (x + w - value_surf.get_width() - 14, top))
 
@@ -2748,10 +2923,10 @@ class FractalParamsPanel:
                 half_w = row["half_w"]
                 min_x = row["min_x"]
                 max_x = row["max_x"]
-                min_label = small_font.render("min", True, (160, 174, 194))
-                max_label = small_font.render("max", True, (160, 174, 194))
-                min_val = small_font.render(self._fmt(key, st["lo"]), True, (220, 232, 244))
-                max_val = small_font.render(self._fmt(key, st["hi"]), True, (220, 232, 244))
+                min_label = _render_text(small_font, "min", (160, 174, 194))
+                max_label = _render_text(small_font, "max", (160, 174, 194))
+                min_val = _render_text(small_font, self._fmt(key, st["lo"]), (220, 232, 244))
+                max_val = _render_text(small_font, self._fmt(key, st["hi"]), (220, 232, 244))
                 screen.blit(min_label, (min_x, bound_top - 1))
                 screen.blit(max_label, (max_x, bound_top - 1))
                 screen.blit(min_val, (min_x + half_w - min_val.get_width(), bound_top - 1))
@@ -2762,8 +2937,8 @@ class FractalParamsPanel:
                 draw_track(row["max_track"], hi_t, accent)
 
                 speed_top = row["speed_top"]
-                speed_label = small_font.render("Speed", True, (160, 174, 194))
-                speed_val = small_font.render(f"{st['speed']:.2f}/s", True, (115, 205, 255))
+                speed_label = _render_text(small_font, "Speed", (160, 174, 194))
+                speed_val = _render_text(small_font, f"{st['speed']:.2f}/s", (115, 205, 255))
                 screen.blit(speed_label, (min_x, speed_top - 1))
                 screen.blit(speed_val, (x + w - 14 - speed_val.get_width(), speed_top - 1))
                 speed_t = (st["speed"] - self.SPEED_MIN) / (self.SPEED_MAX - self.SPEED_MIN)
