@@ -41,7 +41,7 @@ Controls
     Anim checkboxes  enable parameter ping-pong; reveals per-slider min/max + speed
     F                toggle the checkered floor
     H                show/hide all control panels
-    R                reset animation and camera
+    R                reset camera and light orbit, restart scene clock
     Space            pause/resume
     S                save a screenshot at the current quality
     Esc              quit
@@ -1398,8 +1398,20 @@ def mandelbulb_closest_hit(
     teapot_t = teapot_hit[0]
 
     payload = Payload()
+    t_floor = -1.0
+    teapot_first = 0
+    if t_hit > 0.0 and teapot_t > 0.0 and teapot_t < t_hit:
+        teapot_first = 1
     if t_hit < 0.0:
         t_floor = floor_intersection(ro, rd)
+        if teapot_t > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_t < t_floor):
+            teapot_first = 1
+
+    if teapot_first != 0:
+        p_teapot = ro + rd * teapot_t
+        n_teapot = teapot_normal_world(p_teapot, frame)
+        payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
+    elif t_hit < 0.0:
         if floor_enabled != 0 and t_floor > 0.0:
             payload.color = shade_floor(
                 ro + rd * t_floor,
@@ -1412,10 +1424,6 @@ def mandelbulb_closest_hit(
             )
         else:
             payload.color = background_color(rd, camera.forward)
-        if teapot_t > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_t < t_floor):
-            p_teapot = ro + rd * teapot_t
-            n_teapot = teapot_normal_world(p_teapot, frame)
-            payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     else:
         p_local = ro_local + rd_local * t_hit
         n_local = mandelbulb_normal(
@@ -1507,10 +1515,6 @@ def mandelbulb_closest_hit(
                 frame.light_world1,
                 frame.light_world2,
             )
-        if teapot_t > 0.0 and teapot_t < t_hit:
-            p_teapot = ro + rd * teapot_t
-            n_teapot = teapot_normal_world(p_teapot, frame)
-            payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     wp.optix_store_payload(payload)
 
 
@@ -1526,7 +1530,12 @@ def miss(
     rd = wp.normalize(wp.optix_get_world_ray_direction())
     payload = Payload()
     t_floor = floor_intersection(ro, rd)
-    if floor_enabled != 0 and t_floor > 0.0:
+    teapot_hit = teapot_intersect(ro, rd, frame, max_steps)
+    if teapot_hit[0] > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_hit[0] < t_floor):
+        p_teapot = ro + rd * teapot_hit[0]
+        n_teapot = teapot_normal_world(p_teapot, frame)
+        payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
+    elif floor_enabled != 0 and t_floor > 0.0:
         payload.color = shade_floor(
             ro + rd * t_floor,
             rd,
@@ -1539,11 +1548,6 @@ def miss(
     else:
         payload.color = background_color(rd, camera.forward)
 
-    teapot_hit = teapot_intersect(ro, rd, frame, max_steps)
-    if teapot_hit[0] > 0.0 and (floor_enabled == 0 or t_floor < 0.0 or teapot_hit[0] < t_floor):
-        p_teapot = ro + rd * teapot_hit[0]
-        n_teapot = teapot_normal_world(p_teapot, frame)
-        payload.color = shade_teapot(p_teapot, n_teapot, rd, frame)
     wp.optix_store_payload(payload)
 
 
@@ -1848,9 +1852,9 @@ class QualitySlider:
         material_gap = 22
         material_w = max(72, (track_w - material_gap) // 2)
         glass_x = track_x + material_w + material_gap
-        self.shine_rect = (track_x, panel_y + 84 - 8, material_w, 16)
-        self.glass_ior_rect = (glass_x, panel_y + 84 - 8, material_w, 16)
-        self.glass_rect = (glass_x, panel_y + 63, 16, 16)
+        self.shine_rect = (track_x, panel_y + 85 - 8, material_w, 16)
+        self.glass_ior_rect = (glass_x, panel_y + 85 - 8, material_w, 16)
+        self.glass_rect = (glass_x, panel_y + 60, 16, 16)
         self.floor_rect = (panel_x + 14, panel_y + 98, 18, 18)
         self._panel_surface = None
 
@@ -2137,17 +2141,17 @@ class LightsPanel:
     def hit_color(self, index: int, channel: str, pos: tuple[int, int]) -> bool:
         if not 0 <= index < len(self.rows):
             return False
-        return self._rect_hit(self.rows[index]["color_rects"][channel], pos, pad=4)
+        return self._rect_hit(self.rows[index]["color_rects"][channel], pos, pad=3)
 
     def hit_ambient(self, channel: str, pos: tuple[int, int]) -> bool:
         if self.ambient_row is None:
             return False
-        return self._rect_hit(self.ambient_row["color_rects"][channel], pos, pad=10)
+        return self._rect_hit(self.ambient_row["color_rects"][channel], pos, pad=3)
 
     def hit_fractal(self, channel: str, pos: tuple[int, int]) -> bool:
         if self.fractal_row is None:
             return False
-        return self._rect_hit(self.fractal_row["color_rects"][channel], pos, pad=10)
+        return self._rect_hit(self.fractal_row["color_rects"][channel], pos, pad=3)
 
     def hit_orbit(self, index: int, pos: tuple[int, int]) -> bool:
         if not 0 <= index < len(self.rows):
@@ -2157,7 +2161,7 @@ class LightsPanel:
     def hit_light_speed(self, index: int, pos: tuple[int, int]) -> bool:
         if not 0 <= index < len(self.rows):
             return False
-        return self._rect_hit(self.rows[index]["color_rects"]["s"], pos, pad=4)
+        return self._rect_hit(self.rows[index]["color_rects"]["s"], pos, pad=3)
 
     def toggle_enabled(self, index: int) -> bool:
         self.enabled[index] = not self.enabled[index]
@@ -2479,7 +2483,7 @@ class FractalParamsPanel:
                 "label": label,
                 "accent": accent,
                 "check": (panel_x + 14, cursor, 16, 16),
-                "track": (panel_x + 14, cursor + 20 - 8, panel_w - 28, 16),
+                "track": (panel_x + 42, cursor + 20 - 8, panel_w - 56, 16),
             }
             self.rows[key] = row
             cursor += self.ROW_H
@@ -2489,7 +2493,7 @@ class FractalParamsPanel:
                 half_w = (panel_w - 28 - gap) // 2
                 min_x = panel_x + 14
                 max_x = min_x + half_w + gap
-                label_w = 24
+                label_w = 20
                 value_w = 38
                 track_w = max(30, half_w - label_w - value_w)
                 track_y = cursor + 12 - 7
@@ -2530,7 +2534,7 @@ class FractalParamsPanel:
         if not row:
             return False
         x, y, w, h = row["check"]
-        return x - 5 <= pos[0] <= x + w + 5 and y - 5 <= pos[1] <= y + h + 5
+        return x - 2 <= pos[0] <= x + w + 2 and y - 2 <= pos[1] <= y + h + 2
 
     def hit_track(self, key: str, pos: tuple[int, int]) -> bool:
         row = self.rows.get(key)
@@ -3259,6 +3263,10 @@ def main() -> int:
 
     if args.width < 1 or args.height < 1:
         parser.error("--width and --height must be positive")
+    if args.fps <= 0:
+        parser.error("--fps must be positive")
+    if args.frames < 0:
+        parser.error("--frames must be zero or greater")
     if args.quality is not None and not 1 <= args.quality <= len(QUALITY_PRESETS):
         parser.error(f"--quality must be between 1 and {len(QUALITY_PRESETS)}")
     if not 0 <= args.shininess <= 100:
